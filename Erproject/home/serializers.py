@@ -2,6 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.contrib.auth.hashers import make_password
 from .models import User, UserCreationRequest, Dashboard, DashboardCreationRequest
+from .models import PersonalDetail, Attendance
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -187,3 +188,82 @@ class DashboardCreationRequestSerializer(serializers.ModelSerializer):
 class ApproveDashboardCreationSerializer(serializers.Serializer):
     approve = serializers.BooleanField(required=True)
     rejection_reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class PersonalDetailSerializer(serializers.ModelSerializer):
+    user_email = serializers.EmailField(source="user.email", read_only=True)
+    user_id = serializers.IntegerField(source="user.id", read_only=True)
+
+    class Meta:
+        model = PersonalDetail
+        fields = [
+            "id",
+            "user_id",
+            "user_email",
+            "phone",
+            "address",
+            "dob",
+            "designation",
+            "department",
+            "emergency_contact",
+            "additional_info",
+            "image_link",  # 👈 Added
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at", "user_email", "user_id"]
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        user = request.user if request else None
+
+        if user and hasattr(user, "role") and user.role == "SUPERADMIN":
+            raise serializers.ValidationError("Cannot create personal detail for SUPERADMIN.")
+        return attrs
+
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        user = request.user if request else None
+
+        if user and hasattr(user, "role") and user.role == "SUPERADMIN":
+            raise serializers.ValidationError("Cannot create personal detail for SUPERADMIN.")
+        return attrs
+
+
+
+class AttendanceSerializer(serializers.ModelSerializer):
+    user_email = serializers.EmailField(source="user.email", read_only=True)
+    recorded_by_email = serializers.EmailField(source="recorded_by.email", read_only=True)
+
+    class Meta:
+        model = Attendance
+        fields = [
+            "id",
+            "user",
+            "user_email",
+            "date",
+            "status",
+            "check_in",
+            "check_out",
+            "notes",
+            "recorded_by",
+            "recorded_by_email",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at", "user_email", "recorded_by_email"]
+
+    def validate(self, attrs):
+        user = attrs.get("user") or (self.instance and self.instance.user)
+        if user and user.role == "SUPERADMIN":
+            raise serializers.ValidationError("Cannot record attendance for SUPERADMIN.")
+        return attrs
+
+    def create(self, validated_data):
+        # set recorded_by to request.user if provided in context
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            validated_data.setdefault("recorded_by", request.user)
+        return super().create(validated_data)
