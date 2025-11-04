@@ -1,0 +1,10 @@
+asgiref                       3.10.0
+bcrypt                        5.0.0
+Django                        5.2.7
+djangorestframework           3.16.1
+djangorestframework_simplejwt 5.5.1
+pip                           25.3
+psycopg2-binary               2.9.11
+PyJWT                         2.10.1
+sqlparse                      0.5.3
+tzdata                        2025.2
