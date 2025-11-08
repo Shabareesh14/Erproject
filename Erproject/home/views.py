@@ -1,4 +1,4 @@
-from rest_framework import status, viewsets, generics, permissions, filters
+from rest_framework import status, viewsets, generics
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -16,8 +16,6 @@ from .serializers import (
     ApproveDashboardCreationSerializer,
 )
 from .permissions import IsSuperAdmin, IsAdminOrSuperAdmin, IsFacultyOrAbove
-from .models import PersonalDetail, Attendance
-from .serializers import PersonalDetailSerializer, AttendanceSerializer
 
 
 def get_tokens_for_user(user):
@@ -74,22 +72,19 @@ class UserViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        # SUPERADMIN sees all users
         if user.role == "SUPERADMIN":
             return User.objects.all()
-        # ADMIN sees everyone except SUPERADMIN
         elif user.role == "ADMIN":
-            return User.objects.exclude(role="SUPERADMIN")
-        # FACULTY sees faculty and students (and staff) but not admins/superadmin
-        elif user.role == "FACULTY":
             return User.objects.filter(role__in=["FACULTY", "STUDENT"])
-        # STUDENT sees only themselves
+        elif user.role == "FACULTY":
+            return User.objects.filter(role="STUDENT")
         else:
             return User.objects.filter(id=user.id)
 
     @action(detail=False, methods=["get"])
     def me(self, request):
-        return Response(UserSerializer(request.user).data, status=status.HTTP_200_OK)
+        serializer = self.get_serializer(request.user)
+        return Response(serializer.data)
 
 
 class UserCreationRequestViewSet(viewsets.ModelViewSet):
@@ -98,13 +93,12 @@ class UserCreationRequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        # SUPERADMIN sees all requests
         if user.role == "SUPERADMIN":
             return UserCreationRequest.objects.all()
-        # ADMIN sees requests except those created by SUPERADMIN (they approve subordinate requests)
         elif user.role == "ADMIN":
-            return UserCreationRequest.objects.exclude(requested_by__role="SUPERADMIN")
-        # FACULTY sees only their own requests
+            return UserCreationRequest.objects.filter(
+                requested_by__role__in=["FACULTY", "ADMIN"]
+            )
         elif user.role == "FACULTY":
             return UserCreationRequest.objects.filter(requested_by=user)
         return UserCreationRequest.objects.none()
@@ -114,105 +108,147 @@ class UserCreationRequestViewSet(viewsets.ModelViewSet):
 
         # Check authentication
         if not user.is_authenticated:
-            return Response({"detail": "Authentication required."}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response(
+                {"error": "Authentication credentials were not provided"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
         # Check if user has role attribute
         if not hasattr(user, "role"):
-            return Response({"detail": "Invalid user."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "User does not have a role assigned"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # STUDENT cannot create users
         if user.role == "STUDENT":
-            return Response({"detail": "Students cannot create user requests."}, status=status.HTTP_403_FORBIDDEN)
-
-        # SUPERADMIN creates directly (bypass request)
-        if user.role == "SUPERADMIN":
-            data = request.data.copy()
-            data["role"] = data.get("role", "STUDENT")
-            serializer = RegisterSerializer(data=data)
-            serializer.is_valid(raise_exception=True)
-            created_user = serializer.save()
             return Response(
-                {"message": "User created directly by SUPERADMIN", "user": UserSerializer(created_user).data},
-                status=status.HTTP_201_CREATED,
+                {"error": "Students cannot create users"},
+                status=status.HTTP_403_FORBIDDEN,
             )
+
+        # SUPERADMIN creates directly
+        if user.role == "SUPERADMIN":
+            try:
+                user_serializer = RegisterSerializer(
+                    data=request.data, context={"request": request}
+                )
+                user_serializer.is_valid(raise_exception=True)
+                new_user = user_serializer.save()
+                return Response(
+                    {
+                        "message": "User created directly by SUPERADMIN",
+                        "user": UserSerializer(new_user).data,
+                    },
+                    status=status.HTTP_201_CREATED,
+                )
+            except Exception as e:
+                return Response(
+                    {"error": f"Failed to create user: {str(e)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # FACULTY/ADMIN create request
         try:
-            data = request.data.copy()
-            serializer = self.get_serializer(data=data)
+            serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
-            req = serializer.save(requested_by=user)
-            return Response({"message": "User creation request submitted", "request": self.get_serializer(req).data},
-                            status=status.HTTP_201_CREATED)
+            request_obj = serializer.save()
+
+            approver = "ADMIN" if user.role == "FACULTY" else "SUPERADMIN"
+            return Response(
+                {
+                    "message": f"Request submitted. Waiting for {approver} approval",
+                    "request": UserCreationRequestSerializer(request_obj).data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": f"Failed to create request: {str(e)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
-        req = self.get_object()
-        current = request.user
+        try:
+            request_obj = self.get_object()
+            user = request.user
 
-        # Only ADMIN or SUPERADMIN can approve/reject
-        if current.role not in ["ADMIN", "SUPERADMIN"]:
-            return Response({"detail": "Not authorized to approve requests."}, status=status.HTTP_403_FORBIDDEN)
+            if request_obj.status != "PENDING":
+                return Response(
+                    {"error": f"Request already {request_obj.status.lower()}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        if req.status != "PENDING":
-            return Response({"detail": "Request already processed."}, status=status.HTTP_400_BAD_REQUEST)
+            # Validate approver
+            if request_obj.requested_by.role == "FACULTY" and user.role not in [
+                "ADMIN",
+                "SUPERADMIN",
+            ]:
+                return Response(
+                    {"error": "Only ADMIN/SUPERADMIN can approve FACULTY requests"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
 
-        approve_flag = request.data.get("approve", True)
-        rejection_reason = request.data.get("rejection_reason", "")
+            if request_obj.requested_by.role == "ADMIN" and user.role != "SUPERADMIN":
+                return Response(
+                    {"error": "Only SUPERADMIN can approve ADMIN requests"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
 
-        with transaction.atomic():
-            if approve_flag:
-                # prevent duplicate emails
-                if User.objects.filter(email=req.email).exists():
-                    return Response({"detail": "User with this email already exists."}, status=status.HTTP_400_BAD_REQUEST)
-                # req.password stored hashed by serializer; detect hashing to avoid double-hashing
-                raw_password = req.password or ""
-                is_hashed = raw_password.startswith("pbkdf2_") or raw_password.startswith("argon2") or raw_password.startswith("bcrypt_")
-                if is_hashed:
-                    # create user using hashed password directly
+            serializer = ApproveUserCreationSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+
+            with transaction.atomic():
+                if serializer.validated_data["approve"]:
+                    request_obj.status = "APPROVED"
+                    request_obj.approved_by = user
+                    request_obj.save()
+
                     new_user = User.objects.create(
-                        username=req.username,
-                        email=req.email,
-                        password=req.password,
-                        role=req.role,
+                        username=request_obj.username,
+                        email=request_obj.email,
+                        password=request_obj.password,
+                        role=request_obj.role,
+                    )
+
+                    return Response(
+                        {
+                            "message": "Request approved",
+                            "user": UserSerializer(new_user).data,
+                        },
+                        status=status.HTTP_200_OK,
                     )
                 else:
-                    new_user = User.objects.create_user(
-                        username=req.username,
-                        email=req.email,
-                        password=req.password,
-                        role=req.role,
+                    request_obj.status = "REJECTED"
+                    request_obj.approved_by = user
+                    request_obj.rejection_reason = serializer.validated_data.get(
+                        "rejection_reason"
                     )
-                req.status = "APPROVED"
-                req.approved_by = current
-                req.save()
-                return Response({"message": "Request approved and user created", "user": UserSerializer(new_user).data},
-                                status=status.HTTP_201_CREATED)
-            else:
-                req.status = "REJECTED"
-                req.rejection_reason = rejection_reason
-                req.approved_by = current
-                req.save()
-                return Response({"message": "Request rejected", "request": self.get_serializer(req).data},
-                                status=status.HTTP_200_OK)
+                    request_obj.save()
+                    return Response(
+                        {"message": "Request rejected"}, status=status.HTTP_200_OK
+                    )
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to process approval: {str(e)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
     @action(detail=False, methods=["get"])
     def pending(self, request):
         user = request.user
         if user.role == "SUPERADMIN":
-            qs = UserCreationRequest.objects.filter(status="PENDING")
+            pending = UserCreationRequest.objects.filter(status="PENDING")
         elif user.role == "ADMIN":
-            qs = UserCreationRequest.objects.filter(status="PENDING").exclude(requested_by__role="SUPERADMIN")
-        elif user.role == "FACULTY":
-            qs = UserCreationRequest.objects.filter(requested_by=user, status="PENDING")
+            pending = UserCreationRequest.objects.filter(
+                status="PENDING", requested_by__role="FACULTY"
+            )
         else:
-            qs = UserCreationRequest.objects.none()
-        page = self.paginate_queryset(qs)
-        if page is not None:
-            return self.get_paginated_response(self.get_serializer(page, many=True).data)
-        return Response(self.get_serializer(qs, many=True).data, status=status.HTTP_200_OK)
+            pending = UserCreationRequest.objects.none()
+
+        serializer = self.get_serializer(pending, many=True)
+        return Response(serializer.data)
 
 
 class DashboardViewSet(viewsets.ModelViewSet):
@@ -223,7 +259,6 @@ class DashboardViewSet(viewsets.ModelViewSet):
         return Dashboard.objects.filter(is_active=True)
 
     def get_permissions(self):
-        # Only SUPERADMIN may mutate dashboards, others can read
         if self.action in ["create", "update", "partial_update", "destroy"]:
             return [IsSuperAdmin()]
         return [IsAuthenticated()]
@@ -241,175 +276,77 @@ class DashboardCreationRequestViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         if request.user.role not in ["ADMIN", "SUPERADMIN"]:
-            return Response({"detail": "Only ADMIN or SUPERADMIN can request dashboard creation."},
-                            status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"error": "Only ADMIN/SUPERADMIN"}, status=status.HTTP_403_FORBIDDEN
+            )
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        req_obj = serializer.save(requested_by=request.user)
+        request_obj = serializer.save()
 
-        # If SUPERADMIN created the request, auto-approve and create the dashboard
         if request.user.role == "SUPERADMIN":
-            with transaction.atomic():
-                dash = Dashboard.objects.create(
-                    title=req_obj.title,
-                    description=req_obj.description,
-                    created_by=request.user,
-                    is_active=True,
-                )
-                req_obj.dashboard = dash
-                req_obj.status = "APPROVED"
-                req_obj.approved_by = request.user
-                req_obj.save()
-                return Response({"message": "Dashboard created by SUPERADMIN", "dashboard": DashboardSerializer(dash).data},
-                                status=status.HTTP_201_CREATED)
+            return Response(
+                {
+                    "message": "Dashboard created by SUPERADMIN",
+                    "dashboard": DashboardSerializer(request_obj.dashboard).data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
 
         return Response(
             {
                 "message": "Request submitted. Waiting for SUPERADMIN approval",
-                "request": self.get_serializer(req_obj).data,
+                "request": serializer.data,
             },
             status=status.HTTP_201_CREATED,
         )
 
     @action(detail=True, methods=["post"], permission_classes=[IsSuperAdmin])
     def approve(self, request, pk=None):
-        req = self.get_object()
-        if req.status != "PENDING":
-            return Response({"detail": "Request already processed."}, status=status.HTTP_400_BAD_REQUEST)
+        request_obj = self.get_object()
+
+        if request_obj.status != "PENDING":
+            return Response(
+                {"error": f"Already {request_obj.status.lower()}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = ApproveDashboardCreationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            dash = Dashboard.objects.create(
-                title=req.title,
-                description=req.description,
-                created_by=request.user,
-                is_active=True,
-            )
-            req.dashboard = dash
-            req.status = "APPROVED"
-            req.approved_by = request.user
-            req.save()
-            return Response({"message": "Dashboard created", "dashboard": DashboardSerializer(dash).data},
-                            status=status.HTTP_201_CREATED)
+            if serializer.validated_data["approve"]:
+                request_obj.status = "APPROVED"
+                request_obj.approved_by = request.user
+
+                dashboard = Dashboard.objects.create(
+                    title=request_obj.title,
+                    description=request_obj.description,
+                    created_by=request_obj.requested_by,
+                )
+                request_obj.dashboard = dashboard
+                request_obj.save()
+
+                return Response(
+                    {
+                        "message": "Dashboard approved",
+                        "dashboard": DashboardSerializer(dashboard).data,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+            else:
+                request_obj.status = "REJECTED"
+                request_obj.approved_by = request.user
+                request_obj.rejection_reason = serializer.validated_data.get(
+                    "rejection_reason"
+                )
+                request_obj.save()
+                return Response(
+                    {"message": "Request rejected"}, status=status.HTTP_200_OK
+                )
 
     @action(detail=False, methods=["get"], permission_classes=[IsSuperAdmin])
     def pending(self, request):
-        qs = DashboardCreationRequest.objects.filter(status="PENDING")
-        page = self.paginate_queryset(qs)
-        if page is not None:
-            return self.get_paginated_response(self.get_serializer(page, many=True).data)
-        return Response(self.get_serializer(qs, many=True).data, status=status.HTTP_200_OK)
-
-
-class ExcludeSuperadminMixin:
-    def get_queryset(self):
-        qs = super().get_queryset()
-        # If the model has a 'user' FK, exclude entries where the related user is SUPERADMIN
-        try:
-            if hasattr(qs.model, "user"):
-                return qs.exclude(user__role="SUPERADMIN")
-        except Exception:
-            pass
-        return qs
-
-
-class PersonalDetailViewSet(ExcludeSuperadminMixin, viewsets.ModelViewSet):
-    """
-    Manage personal details for users other than SUPERADMIN.
-    """
-
-    queryset = PersonalDetail.objects.select_related("user").all()
-    serializer_class = PersonalDetailSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [filters.SearchFilter]
-    search_fields = ["user__username", "user__email", "designation", "department"]
-
-    def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
-
-    def get_object(self):
-        if self.kwargs.get("pk") == "me":
-            obj, _ = PersonalDetail.objects.get_or_create(user=self.request.user)
-            return obj
-        return super().get_object()
-
-    def update(self, request, *args, **kwargs):
-        instance = self.get_object()
-
-        if request.user.role == "SUPERADMIN":
-            return Response(
-                {"detail": "SUPERADMIN cannot update personal details."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        partial = kwargs.pop("partial", False)
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        serializer.save(user=instance.user)
+        pending = DashboardCreationRequest.objects.filter(status="PENDING")
+        serializer = self.get_serializer(pending, many=True)
         return Response(serializer.data)
-
-
-class AttendanceViewSet(ExcludeSuperadminMixin, viewsets.ModelViewSet):
-    """
-    Attendance management.
-
-    Rules:
-    - Only FACULTY or ADMIN can create/update attendance.
-    - STUDENTS can view only their own attendance.
-    - FACULTY can view their own attendance + records they created.
-    - ADMIN can view all (except SUPERADMIN, handled by mixin).
-    """
-
-    queryset = Attendance.objects.select_related("user", "recorded_by").all()
-    serializer_class = AttendanceSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [filters.SearchFilter]
-    search_fields = ["user__username", "user__email", "date", "status"]
-
-    def get_queryset(self):
-        user = self.request.user
-        qs = super().get_queryset()
-
-        if user.role == "STUDENT":
-            return qs.filter(user=user)
-
-        if user.role == "FACULTY":
-            # Faculty can view their own + records they recorded
-            return qs.filter(Q(user=user) | Q(recorded_by=user))
-
-        # Admin or Superadmin (filtered via mixin)
-        return qs
-
-    def create(self, request, *args, **kwargs):
-        """Only FACULTY or ADMIN can create attendance."""
-        if request.user.role not in ["FACULTY", "ADMIN"]:
-            return Response(
-                {"detail": "Only Faculty or Admin can create attendance."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        return super().create(request, *args, **kwargs)
-
-    def update(self, request, *args, **kwargs):
-        """Only FACULTY or ADMIN can update attendance."""
-        if request.user.role not in ["FACULTY", "ADMIN"]:
-            return Response(
-                {"detail": "Only Faculty or Admin can update attendance."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        try:
-            instance = self.get_object()
-        except Attendance.DoesNotExist:
-            return Response(
-                {"detail": "Attendance record not found for the given ID."},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        partial = kwargs.pop('partial', False)
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
-        return Response(serializer.data)
-    def perform_create(self, serializer):
-        # record who created the attendance
-        serializer.save(recorded_by=self.request.user)
